@@ -5,7 +5,7 @@ set -euo pipefail
 
 # Configuration par défaut
 SCRIPT_NAME="build-based-hash-smart.sh"
-VERSION="1.0.1-win-compat"
+VERSION="1.1.4-timeout-protection"
 CACHE_DIR="$HOME/.m2/based-hashed"
 GLOBAL_EXCLUDE_FILE="$CACHE_DIR/global-exclude.txt"
 PROJECT_EXCLUDE_FILE=".build-exclude"
@@ -29,6 +29,7 @@ BUILD_START_TIME=""
 TOTAL_SAVED_TIME=0
 MODULES_INFO=()
 FORCE_BUILD=false
+MODULE_SIZES=() # Tableau associatif pour stocker la taille de chaque module
 
 # Fonction d'affichage avec couleurs
 log_info() {
@@ -64,6 +65,7 @@ Usage: ${SCRIPT_NAME} [options] <project_path>
 
 Description:
   Script intelligent pour builder des projets Maven avec cache basé sur le hash des fichiers sources.
+  Les petits modules et ceux dont dépendent d'autres modules sont buildés en priorité.
   
 Arguments:
   project_path    Chemin vers le projet Maven (simple ou multi-module)
@@ -132,6 +134,18 @@ check_prerequisites() {
     if ! command -v find &> /dev/null; then
         log_error "La commande 'find' n'est pas disponible"
         exit 1
+    fi
+    
+    # Vérifier timeout (disponible par défaut sur la plupart des systèmes Unix modernes)
+    if ! command -v timeout &> /dev/null; then
+        log_warning "La commande 'timeout' n'est pas disponible, certaines protections anti-blocage seront désactivées"
+        # Créer une fonction de remplacement simple qui exécute la commande sans timeout
+        timeout() {
+            if [[ "$1" =~ ^[0-9]+$ ]]; then
+                shift # Ignorer le premier argument (le timeout)
+            fi
+            "$@" # Exécuter la commande sans timeout
+        }
     fi
     
     log_success "Tous les prérequis sont satisfaits"
@@ -295,22 +309,50 @@ calculate_hashes() {
     
     log_info "Calcul des hash des fichiers dans $target_dir..."
     
+    # Ajouter une limite de temps pour éviter les blocages
+    local timeout=300 # 5 minutes
+    
+    # Créer un fichier temporaire pour stocker les résultats intermédiaires
+    local temp_output=$(mktemp)
+    
+    # Construire la commande find
     local find_cmd
     find_cmd=$(build_find_command "$target_dir")
     
-    # Exécuter la commande find et calculer les hash
-    eval "$find_cmd" | while IFS= read -r file; do
+    # Exécuter la commande find avec timeout et gérer les erreurs
+    local find_result=""
+    find_result=$(eval "timeout $timeout $find_cmd" 2>/dev/null || echo "")
+    
+    if [[ $? -eq 124 ]]; then
+        log_warning "Calcul des hash interrompu après $timeout secondes pour $target_dir (trop de fichiers)"
+        echo "timeout:$target_dir/TIMEOUT" > "$output_file"
+        return 0
+    fi
+    
+    # Traiter chaque fichier trouvé
+    echo "$find_result" | while IFS= read -r file; do
         if [[ -f "$file" ]]; then
             # Toujours utiliser des séparateurs / dans les chemins relatifs (pour compatibilité)
             local rel_path
             rel_path=$(echo "${file#$PROJECT_PATH/}" | sed 's/\\/\//g')
             
-            # Calculer le hash du fichier
+            # Calculer le hash du fichier avec timeout pour éviter les blocages sur les gros fichiers
             local hash
-            hash=$($HASH_CMD "$file" | cut -d' ' -f1)
-            echo "$hash:$rel_path"
+            hash=$(timeout 10 $HASH_CMD "$file" 2>/dev/null | cut -d' ' -f1 || echo "timeout")
+            
+            if [[ "$hash" == "timeout" || -z "$hash" ]]; then
+                # Si le calcul du hash prend trop de temps, utiliser la taille et le nom du fichier à la place
+                local size=$(stat -f "%z" "$file" 2>/dev/null || stat -c "%s" "$file" 2>/dev/null || echo "0")
+                hash="size${size}_$(basename "$file")"
+            fi
+            
+            echo "$hash:$rel_path" >> "$temp_output"
         fi
-    done | sort > "$output_file"
+    done
+    
+    # Trier et finaliser le résultat
+    sort "$temp_output" > "$output_file"
+    rm -f "$temp_output"
 }
 
 # Comparaison des hash
@@ -327,6 +369,12 @@ compare_hashes() {
     
     if [[ ! -f "$cached_hash_file" ]]; then
         log_info "Aucun cache trouvé, build nécessaire"
+        return 1
+    fi
+    
+    # Vérifier si le calcul des hash a été interrompu par timeout
+    if grep -q "^timeout:" "$current_hash_file"; then
+        log_warning "Calcul des hash interrompu par timeout, on considère qu'un build est nécessaire"
         return 1
     fi
     
@@ -396,7 +444,7 @@ detect_project_type() {
 
 # Détection des modules Maven
 detect_modules() {
-    local modules=()
+    local temp_modules_file=$(mktemp)
     
     # Lire les modules depuis le pom.xml parent
     if [[ -f "$PROJECT_PATH/pom.xml" ]]; then
@@ -407,21 +455,28 @@ detect_modules() {
             echo "$module_lines" | while IFS= read -r line; do
                 local module
                 module=$(echo "$line" | sed -E 's/<module>(.*)<\/module>/\1/')
-                [[ -n "$module" && -d "$PROJECT_PATH/$module" ]] && modules+=("$module")
+                # Vérifier que le module existe et contient un pom.xml
+                if [[ -n "$module" && -d "$PROJECT_PATH/$module" && -f "$PROJECT_PATH/$module/pom.xml" ]]; then
+                    echo "$module" >> "$temp_modules_file"
+                fi
             done
         fi
     fi
     
     # Si aucun module trouvé via le pom, chercher tous les dossiers avec pom.xml
-    if [[ ${#modules[@]} -eq 0 ]]; then
-        while IFS= read -r pom_file; do
+    if [[ ! -s "$temp_modules_file" ]]; then
+        find "$PROJECT_PATH" -name "pom.xml" -not -path "$PROJECT_PATH/pom.xml" | while IFS= read -r pom_file; do
             local module_dir
             module_dir=$(dirname "${pom_file#$PROJECT_PATH/}")
-            [[ "$module_dir" != "." ]] && modules+=("$module_dir")
-        done < <(find "$PROJECT_PATH" -name "pom.xml" -not -path "$PROJECT_PATH/pom.xml")
+            if [[ "$module_dir" != "." ]]; then
+                echo "$module_dir" >> "$temp_modules_file"
+            fi
+        done
     fi
     
-    printf '%s\n' "${modules[@]}"
+    # Sortir le contenu du fichier et le nettoyer
+    cat "$temp_modules_file" | sort -u
+    rm -f "$temp_modules_file"
 }
 
 # Build d'un projet simple
@@ -476,6 +531,12 @@ build_module() {
     local start_time
     start_time=$(date +%s)
     
+    # Vérifier que le module existe
+    if [[ ! -d "$module_path" || ! -f "$module_path/pom.xml" ]]; then
+        log_warning "Le module '$module' n'existe pas ou n'est pas un module Maven valide, ignoré"
+        return 0
+    fi
+    
     log_info "Analyse du module: $module"
     
     local module_cache_dir="$CACHE_DIR/$module"
@@ -503,7 +564,14 @@ build_module() {
     log_info "[$module] Build en cours..."
     
     cd "$PROJECT_PATH"
-    if mvn clean install -pl "$module" -am -q; then
+    
+    # Utiliser le chemin absolu du pom.xml au lieu du nom du module
+    local module_pom="$module_path/pom.xml"
+    log_info "[$module] Utilisation du POM: $module_pom"
+    
+    # Ajouter un timeout pour éviter les blocages
+    local timeout=1800 # 30 minutes max par module
+    if timeout $timeout mvn clean install -f "$module_pom" -am -q; then
         # Sauvegarder le nouveau cache
         mv "$temp_hash_file" "$cached_hash_file"
         local end_time
@@ -536,13 +604,42 @@ build_multi_module_project() {
         log_info "  - $module"
     done <<< "$modules"
     
+    # Trier les modules par taille (du plus petit au plus grand)
+    log_info "Tri des modules par taille pour une optimisation du build..."
+    
+    # Capturer la sortie dans une variable temporaire
+    local temp_sorted_file=$(mktemp)
+    calculate_module_sizes "$modules" > "$temp_sorted_file"
+    
+    # Filtrer les modules valides
+    local valid_modules_file=$(mktemp)
+    while IFS= read -r module; do
+        # Vérifier si le module existe
+        if [[ -d "$PROJECT_PATH/$module" || -f "$PROJECT_PATH/$module" ]]; then
+            echo "$module" >> "$valid_modules_file"
+        fi
+    done < "$temp_sorted_file"
+    
+    # Lire les modules valides
+    local sorted_modules
+    sorted_modules=$(<"$valid_modules_file")
+    
+    # Afficher l'ordre de build optimisé
+    log_info "Ordre de build optimisé (du plus petit au plus grand):"
+    while IFS= read -r module; do
+        log_info "  - $module"
+    done <<< "$sorted_modules"
+    
+    # Nettoyer les fichiers temporaires
+    rm -f "$temp_sorted_file" "$valid_modules_file"
+    
     local total_start_time
     total_start_time=$(date +%s)
     local modules_built=0
     local modules_cached=0
     local build_failed=false
     
-    # Build de chaque module
+    # Build de chaque module dans l'ordre optimisé
     while IFS= read -r module; do
         if build_module "$module"; then
             # Vérifier si le module a été réellement buildé ou mis en cache
@@ -555,7 +652,7 @@ build_multi_module_project() {
             build_failed=true
             break
         fi
-    done <<< "$modules"
+    done <<< "$sorted_modules"
     
     local total_end_time
     total_end_time=$(date +%s)
@@ -587,6 +684,84 @@ realpath_portable() {
         cd - &>/dev/null || exit 1
         echo "$abs_path"
     fi
+}
+
+# Calcul de la taille des modules et des dépendances pour les trier
+calculate_module_sizes() {
+    local modules="$1"
+    
+    # Rediriger les logs vers le fichier d'erreur standard pour éviter de polluer la sortie standard
+    exec 3>&2  # Sauvegarder stderr
+    
+    # Créer un fichier temporaire pour stocker les tailles et informations de dépendances
+    local size_file=$(mktemp)
+    local log_file=$(mktemp)
+    
+    {
+        echo "Calcul de la taille des modules et analyse des dépendances..." >> "$log_file"
+        
+        # Première passe : analyser les dépendances et calculer la taille des sources
+        while IFS= read -r module; do
+            local module_path="$PROJECT_PATH/$module"
+            local module_size=0
+            local dependency_count=0
+            
+            # Vérifier si le module existe et contient un pom.xml
+            if [[ ! -d "$module_path" || ! -f "$module_path/pom.xml" ]]; then
+                echo "  - $module: ignoré (n'existe pas ou pas de pom.xml)" >> "$log_file"
+                continue
+            fi
+            
+            # Compter le nombre de fichiers source
+            if [[ -d "$module_path/src" ]]; then
+                local find_cmd
+                find_cmd=$(build_find_command "$module_path/src")
+                module_size=$(eval "$find_cmd" | wc -l)
+            fi
+            
+            # Compter le nombre de modules qui dépendent de celui-ci
+            if [[ -f "$module_path/pom.xml" ]]; then
+                local artifactId
+                artifactId=$(grep -o '<artifactId>[^<]*</artifactId>' "$module_path/pom.xml" | head -1 | sed -E 's/<artifactId>(.*)<\/artifactId>/\1/')
+                local groupId
+                groupId=$(grep -o '<groupId>[^<]*</groupId>' "$module_path/pom.xml" | head -1 | sed -E 's/<groupId>(.*)<\/groupId>/\1/')
+                
+                # Si groupId est vide, utiliser le groupId du parent
+                if [[ -z "$groupId" ]]; then
+                    groupId=$(grep -o '<groupId>[^<]*</groupId>' "$PROJECT_PATH/pom.xml" | head -1 | sed -E 's/<groupId>(.*)<\/groupId>/\1/')
+                fi
+                
+                if [[ -n "$artifactId" && -n "$groupId" ]]; then
+                    # Compter les références dans les autres pom.xml
+                    dependency_count=$(grep -r --include="pom.xml" "<artifactId>$artifactId</artifactId>" "$PROJECT_PATH" | grep -v "$module_path/pom.xml" | wc -l)
+                fi
+            fi
+            
+            # Formule de score : taille - (dépendants * facteur)
+            # Plus un module a de dépendants, plus sa priorité est élevée
+            local dep_factor=10
+            local score=$((module_size - (dependency_count * dep_factor)))
+            
+            echo "$module:$score:$module_size:$dependency_count" >> "$size_file"
+            echo "  - $module: $module_size fichiers, $dependency_count dépendants, score: $score" >> "$log_file"
+        done <<< "$modules"
+    } >&3  # Rediriger la sortie vers stderr d'origine
+    
+    # Trier les modules par score (du plus petit au plus grand)
+    local sorted_modules
+    sorted_modules=$(sort -t: -k2,2n "$size_file" | cut -d: -f1)
+    
+    # Afficher les logs
+    log_info "Calcul de la taille des modules et analyse des dépendances..."
+    cat "$log_file" | while IFS= read -r line; do
+        log_info "$line"
+    done
+    
+    # Nettoyer les fichiers temporaires
+    rm -f "$size_file" "$log_file"
+    
+    # Retourner uniquement les noms de modules triés
+    echo "$sorted_modules"
 }
 
 # Fonction principale
