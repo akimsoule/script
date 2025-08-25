@@ -1,244 +1,252 @@
-# ============================ 
-# Paramètres
-# ============================
+<#
+.SYNOPSIS
+Script de compilation intelligent pour projets Maven avec gestion de cache.
+
+.DESCRIPTION
+Ce script PowerShell optimise la compilation des projets Maven en:
+- Vérifiant les modifications des fichiers sources pour une compilation sélective
+- Gérant un cache des dépendances et des artefacts compilés
+- Supportant la compilation de modules spécifiques
+- Permettant l'initialisation du cache et la reconstruction forcée
+
+.PARAMETER p
+Chemin vers le projet Maven à compiler (obligatoire)
+
+.PARAMETER m
+Module spécifique à compiler (optionnel)
+
+.PARAMETER ForceRebuild
+Force la reconstruction complète en ignorant le cache
+
+.PARAMETER Init
+Initialise ou réinitialise le cache
+
+.PARAMETER UseGit
+Utilise Git pour détecter les changements au lieu du hachage des fichiers
+
+.EXAMPLE
+.\build.ps1 -p "C:\MonProjet"
+Compile le projet en utilisant le cache
+
+.EXAMPLE
+.\build.ps1 -p "C:\MonProjet" -m "module-core" -ForceRebuild
+Force la reconstruction du module spécifié
+#>
+
 param(
-    [Parameter(Mandatory=$true)][string]$p,  # Projet (obligatoire)
-    [switch]$Debug,
+    [Parameter(Mandatory=$true)][string]$p,
     [string]$m,
-    [switch]$ForceRebuild
+    [switch]$ForceRebuild,
+    [switch]$Init,
+    [switch]$UseGit
 )
 
-# ============================ 
 # Configuration
-# ============================
-$ExtensionsToHash = @("java", "xml", "properties", "txt", "json", "yml", "yaml", "md", "js", "ts", "css", "ftl")
-$Exclusions = @("target", "build", "bin", "dist", ".idea", ".git", "node_modules", "generated")
+$ExtensionsToHash = @("java", "xml", "properties", "txt", "json", "yml", "yaml")
+$Exclusions = @("target", "build", ".idea", ".git", "node_modules")
 $M2Root = if ($IsWindows) { "$env:USERPROFILE\.m2" } else { "$HOME/.m2" }
 
-# Vérifier que le projet existe
-if (-not (Test-Path $p)) {
-    Write-Host "❌ Le chemin du projet '$p' n'existe pas!" -ForegroundColor Red
-    exit 1
-}
+# Validations principales
+if (-not (Test-Path $p)) { Write-Host "❌ Projet inexistant: $p" -ForegroundColor Red; exit 1 }
+$rootPom = Join-Path $p "pom.xml"
+if (-not (Test-Path $rootPom)) { Write-Host "❌ pom.xml manquant dans: $p" -ForegroundColor Red; exit 1 }
 
-$rootPomPath = Join-Path $p "pom.xml"
-if (-not (Test-Path $rootPomPath)) {
-    Write-Host "❌ Aucun pom.xml trouvé dans '$p'!" -ForegroundColor Red
-    exit 1
-}
-
-# Obtenir info du projet
+# Lecture du pom racine
 try {
-    [xml]$rootPom = Get-Content $rootPomPath
-    $artifactId = $rootPom.project.artifactId
-    $version = $rootPom.project.version
-    if (-not $artifactId -or -not $version) {
-        throw "ArtifactId ou version manquant"
-    }
+    [xml]$pomXml = Get-Content $rootPom
+    $artifactId = $pomXml.project.artifactId
+    $version = $pomXml.project.version
+    if (-not $artifactId -or -not $version) { throw "ArtifactId/version manquant" }
 } catch {
-    Write-Host "❌ Impossible de lire le pom.xml racine: $_" -ForegroundColor Red
-    exit 1
+    Write-Host "❌ Erreur pom.xml: $_" -ForegroundColor Red; exit 1
 }
 
 $CacheRoot = Join-Path $M2Root "cache" "$artifactId-$version"
-$HashFileName = "hash.txt"
+Write-Host "🚀 Projet: $artifactId-$version" -ForegroundColor Green
 
-Write-Host "🚀 Analyse du projet: $artifactId-$version" -ForegroundColor Green
-Write-Host "📁 Projet: $p" -ForegroundColor Cyan
-
-# ============================
 # Fonctions simplifiées
-# ============================
-
-function Get-ProjectModules {
-    $poms = Get-ChildItem -Path $p -Recurse -Filter pom.xml | Where-Object {
-        $path = $_.FullName
-        -not ($Exclusions | Where-Object { $path -like "*$_*" })
+function Get-Modules {
+    $poms = Get-ChildItem $p -Recurse -Filter pom.xml | Where-Object { 
+        -not ($Exclusions | Where-Object { $_.FullName -like "*$_*" })
     }
     
     $modules = @{}
-    $dependencies = @{}
+    $deps = @{}
     
-    foreach ($pomFile in $poms) {
+    foreach ($pom in $poms) {
         try {
-            [xml]$pomXml = Get-Content $pomFile.FullName
-            $modId = $pomXml.project.artifactId
-            if ($modId) {
-                $modules[$modId] = $pomFile.Directory.FullName
-                
-                # Récupérer dépendances internes
-                $deps = @()
-                if ($pomXml.project.dependencies.dependency) {
-                    $deps += $pomXml.project.dependencies.dependency.artifactId | Where-Object { $modules.ContainsKey($_) }
-                }
-                $dependencies[$modId] = $deps
+            [xml]$xml = Get-Content $pom.FullName
+            $id = $xml.project.artifactId
+            if ($id) {
+                $modules[$id] = $pom.Directory.FullName
+                $deps[$id] = @($xml.project.dependencies.dependency.artifactId | Where-Object { $modules.ContainsKey($_) })
             }
-        } catch {
-            Write-Warning "⚠️ Erreur lors de la lecture de $($pomFile.FullName)"
-        }
+        } catch { }
     }
-    
-    return @{ Modules = $modules; Dependencies = $dependencies }
+    return @{ Modules = $modules; Dependencies = $deps }
 }
 
-function Get-ModuleHash {
-    param([string]$ModulePath)
-    
-    $files = Get-ChildItem -Path $ModulePath -Recurse -File | Where-Object {
-        $ext = $_.Extension.TrimStart(".")
-        ($ExtensionsToHash -contains $ext) -and -not ($Exclusions | Where-Object { $_.FullName -like "*$_*" })
+function Get-Hash($path) {
+    $files = Get-ChildItem $path -Recurse -File | Where-Object {
+        ($ExtensionsToHash -contains $_.Extension.TrimStart(".")) -and 
+        -not ($Exclusions | Where-Object { $_.FullName -like "*$_*" })
     }
+    if (-not $files) { return "EMPTY" }
     
-    if ($files.Count -eq 0) { return "NO_FILES" }
-    
-    $hashes = $files | ForEach-Object { (Get-FileHash $_.FullName -Algorithm SHA256).Hash }
-    $combined = [string]::Join("", $hashes)
-    return (Get-FileHash -InputStream ([System.IO.MemoryStream]::new([System.Text.Encoding]::UTF8.GetBytes($combined))) -Algorithm SHA256).Hash
+    $combined = ($files | ForEach-Object { (Get-FileHash $_.FullName).Hash }) -join ""
+    return (Get-FileHash -InputStream ([System.IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes($combined)))).Hash
 }
 
-function Get-HashCache {
-    $cachePath = Join-Path $CacheRoot $HashFileName
+function Get-CachedHashes {
+    $cachePath = Join-Path $CacheRoot "hash.txt"
     if (-not (Test-Path $cachePath)) { return @{} }
-    
     try {
         $content = Get-Content $cachePath -Raw | ConvertFrom-Json
-        return $content.ModuleHashes
-    } catch {
-        return @{}
-    }
+        $result = @{}
+        $content.ModuleHashes.PSObject.Properties | ForEach-Object { $result[$_.Name] = $_.Value }
+        return $result
+    } catch { return @{} }
 }
 
-function Set-HashCache {
-    param([hashtable]$HashCache)
-    
-    if (-not (Test-Path $CacheRoot)) { New-Item -Path $CacheRoot -ItemType Directory -Force | Out-Null }
-    
-    $cacheData = @{
-        ModuleHashes = $HashCache
-        LastUpdated = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-        ProjectInfo = @{ ArtifactId = $artifactId; Version = $version }
-    }
-    
-    $cacheData | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $CacheRoot $HashFileName) -Encoding UTF8
+function Set-CachedHashes($hashes) {
+    if (-not (Test-Path $CacheRoot)) { New-Item $CacheRoot -ItemType Directory -Force | Out-Null }
+    @{ ModuleHashes = $hashes; LastUpdated = Get-Date } | ConvertTo-Json | 
+        Set-Content (Join-Path $CacheRoot "hash.txt") -Encoding UTF8
 }
 
-function Get-Dependents {
-    param([string]$Module, [hashtable]$Dependencies)
+function Get-GitChanges($modules) {
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { return $null }
     
-    $dependents = @()
-    foreach ($mod in $Dependencies.Keys) {
-        if ($Dependencies[$mod] -contains $Module) {
-            $dependents += $mod
-            $dependents += Get-Dependents -Module $mod -Dependencies $Dependencies
+    Push-Location $p
+    try {
+        if (-not (git rev-parse --is-inside-work-tree 2>$null)) { return $null }
+        
+        $changedFiles = @()
+        $changedFiles += git ls-files --others --exclude-standard 2>$null
+        $changedFiles += git diff --name-only 2>$null
+        $changedFiles += git diff --name-only --staged 2>$null
+        
+        $changedFiles = $changedFiles | Where-Object { $_ } | Sort-Object -Unique
+        if (-not $changedFiles) { return @() }
+        
+        $changedModules = @()
+        $projectPath = Resolve-Path $p
+        
+        foreach ($module in $modules.Keys) {
+            $relPath = $modules[$module].Replace($projectPath, "").TrimStart("/\")
+            if ($changedFiles | Where-Object { $_ -like "$relPath*" }) {
+                $changedModules += $module
+            }
+        }
+        return $changedModules
+    } catch { return $null }
+    finally { Pop-Location }
+}
+
+function Get-Dependents($module, $deps) {
+    $result = @()
+    foreach ($mod in $deps.Keys) {
+        if ($deps[$mod] -contains $module) {
+            $result += $mod
+            $result += Get-Dependents $mod $deps
         }
     }
-    return $dependents | Sort-Object -Unique
+    return $result | Sort-Object -Unique
 }
 
-# ============================
 # Script principal
-# ============================
-
-$projectData = Get-ProjectModules
+$projectData = Get-Modules
 $modules = $projectData.Modules
 $dependencies = $projectData.Dependencies
 
-if ($modules.Count -eq 0) {
-    Write-Host "❌ Aucun module Maven trouvé dans le projet!" -ForegroundColor Red
-    exit 1
-}
+if ($modules.Count -eq 0) { Write-Host "❌ Aucun module trouvé" -ForegroundColor Red; exit 1 }
 
-Write-Host "📦 Modules trouvés: $($modules.Keys.Count)" -ForegroundColor Cyan
+# Write-Host "📦 Modules:"
+# $modules.Keys | ForEach-Object { Write-Host "  - $_" -ForegroundColor Cyan }
+
+# Initialisation du cache
+if ($Init) {
+    $cache = @{}
+    foreach ($mod in $modules.Keys) { $cache[$mod] = Get-Hash $modules[$mod] }
+    Set-CachedHashes $cache
+    Write-Host "✅ Cache initialisé" -ForegroundColor Green
+    exit 0
+}
 
 # Déterminer les modules à traiter
 if ($m) {
-    $specifiedModules = $m -split ',' | ForEach-Object { $_.Trim() }
-    $validModules = @()
-    $invalidModules = @()
-    
-    foreach ($module in $specifiedModules) {
-        if ($modules.ContainsKey($module)) {
-            $validModules += $module
-        } else {
-            $invalidModules += $module
-        }
-    }
-    
-    if ($invalidModules.Count -gt 0) {
-        Write-Host "❌ Modules non trouvés: $($invalidModules -join ', ')" -ForegroundColor Red
-        Write-Host "💡 Modules disponibles: $($modules.Keys -join ', ')" -ForegroundColor Yellow
+    $specified = $m -split ',' | ForEach-Object { $_.Trim() }
+    $invalid = $specified | Where-Object { -not $modules.ContainsKey($_) }
+    if ($invalid) {
+        Write-Host "❌ Modules inexistants: $($invalid -join ', ')" -ForegroundColor Red
+        Write-Host "💡 Disponibles: $($modules.Keys -join ', ')" -ForegroundColor Yellow
         exit 1
     }
-    
-    $modulesToProcess = $validModules
-    Write-Host "🎯 Modules spécifiés: $($modulesToProcess -join ', ')" -ForegroundColor Green
+    $modulesToBuild = $specified
 } else {
-    # Détecter les modules modifiés
-    $oldCache = Get-HashCache
-    $newCache = @{}
+    # Détection automatique
     $modifiedModules = @()
     
-    Write-Host "🔍 Analyse des modifications..." -ForegroundColor Yellow
-    
-    foreach ($module in $modules.Keys) {
-        $hash = Get-ModuleHash -ModulePath $modules[$module]
-        $newCache[$module] = $hash
-        
-        if ($ForceRebuild -or -not $oldCache.ContainsKey($module) -or $oldCache[$module] -ne $hash) {
-            $modifiedModules += $module
+    if ($UseGit) {
+        $gitChanges = Get-GitChanges $modules
+        if ($null -ne $gitChanges) {
+            $modifiedModules = $gitChanges
+            if ($ForceRebuild -and $modifiedModules.Count -eq 0) { $modifiedModules = $modules.Keys }
+        } else {
+            Write-Host "⚠️ Git indisponible, utilisation du cache" -ForegroundColor Yellow
+            $UseGit = $false
         }
     }
     
-    Set-HashCache -HashCache $newCache
+    if (-not $UseGit) {
+        $oldHashes = Get-CachedHashes
+        $newHashes = @{}
+        
+        foreach ($mod in $modules.Keys) {
+            $hash = Get-Hash $modules[$mod]
+            $newHashes[$mod] = $hash
+            if ($ForceRebuild -or $oldHashes[$mod] -ne $hash) { $modifiedModules += $mod }
+        }
+        Set-CachedHashes $newHashes
+    }
     
     if ($modifiedModules.Count -eq 0) {
-        Write-Host "✅ Aucune modification détectée. Rien à construire." -ForegroundColor Green
+        Write-Host "✅ Aucune modification détectée" -ForegroundColor Green
         exit 0
     }
     
-    $modulesToProcess = $modifiedModules
-    Write-Host "🔄 Modules modifiés: $($modulesToProcess -join ', ')" -ForegroundColor Green
+    $modulesToBuild = $modifiedModules
 }
 
-# Calculer tous les modules affectés (incluant les dépendants)
-$allAffectedModules = @($modulesToProcess)
-foreach ($module in $modulesToProcess) {
-    $dependents = Get-Dependents -Module $module -Dependencies $dependencies
-    $allAffectedModules += $dependents
+# Inclure les dépendants
+$allModules = @($modulesToBuild)
+foreach ($mod in $modulesToBuild) {
+    $allModules += Get-Dependents $mod $dependencies
 }
-$allAffectedModules = $allAffectedModules | Sort-Object -Unique
+$allModules = $allModules | Sort-Object -Unique
 
-Write-Host "⚡ Modules à reconstruire: $($allAffectedModules -join ', ')" -ForegroundColor Cyan
+Write-Host "🔄 Modules à construire: $($allModules -join ', ')" -ForegroundColor Green
 
-# Générer commande Maven
-$isRootAffected = $allAffectedModules -contains $artifactId
-
-if ($isRootAffected -or $allAffectedModules.Count -eq $modules.Count) {
-    $mavenCommand = "mvn clean install -T 1C"
+# Commande Maven
+$isRootAffected = $allModules -contains $artifactId
+if ($isRootAffected -or $allModules.Count -eq $modules.Count) {
+    $cmd = "mvn clean install -T 1C"
 } else {
-    $projectsArg = ($allAffectedModules | ForEach-Object { ":$_" }) -join ","
-    $mavenCommand = "mvn clean install --projects $projectsArg --also-make-dependents -T 1C"
+    $projects = ($allModules | ForEach-Object { ":$_" }) -join ","
+    $cmd = "mvn clean install --projects $projects --also-make-dependents -T 1C"
 }
 
-Write-Host "`n🔨 Commande Maven:" -ForegroundColor Yellow
-Write-Host "   $mavenCommand" -ForegroundColor White
+Write-Host "`n🔨 Commande: $cmd" -ForegroundColor Yellow
 
 # Exécution
-$confirmation = Read-Host "`n❓ Exécuter maintenant? (O/N)"
-if ($confirmation -match "^[OoYy]") {
-    Write-Host "▶️ Exécution en cours..." -ForegroundColor Green
+$confirm = Read-Host "❓ Exécuter? (O/N)"
+if ($confirm -match "^[OoYy]") {
     Push-Location $p
     try {
-        Invoke-Expression $mavenCommand
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "✅ Build terminé avec succès!" -ForegroundColor Green
-        } else {
-            Write-Host "❌ Échec du build (code: $LASTEXITCODE)" -ForegroundColor Red
-            exit $LASTEXITCODE
-        }
-    } finally {
-        Pop-Location
-    }
+        Invoke-Expression $cmd
+        if ($LASTEXITCODE -ne 0) { Write-Host "❌ Build échoué" -ForegroundColor Red; exit $LASTEXITCODE }
+        Write-Host "✅ Build réussi!" -ForegroundColor Green
+    } finally { Pop-Location }
 } else {
-    Write-Host "⏸️ Commande non exécutée." -ForegroundColor Yellow
+    Write-Host "⏸️ Annulé" -ForegroundColor Yellow
 }
