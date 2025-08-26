@@ -208,11 +208,13 @@ public class MavenSmartBuilder {
     // ========== HASHING OPTIMISÉ ==========
     
     private String computeModuleHash(String modulePath) throws Exception {
-        try (Stream<Path> files = Files.walk(Paths.get(modulePath))) {
+        Path moduleDir = Paths.get(modulePath);
+        try (Stream<Path> files = Files.walk(moduleDir)) {
             String[] sortedFiles = files.parallel()
                 .filter(Files::isRegularFile)
                 .filter(this::isHashableFile)
                 .filter(this::isNotExcluded)
+                .filter(path -> !isInSubModule(moduleDir, path))
                 .map(Path::toString)
                 .sorted()
                 .toArray(String[]::new);
@@ -225,6 +227,26 @@ public class MavenSmartBuilder {
                 .map(this::computeFileHash)
                 .reduce("", this::combineHashes);
         }
+    }
+    
+    /**
+     * Vérifie si un fichier appartient à un sous-module en cherchant
+     * un pom.xml dans le chemin entre le module racine et le fichier.
+     */
+    private boolean isInSubModule(Path moduleRoot, Path filePath) {
+        Path current = filePath.getParent();
+        
+        // Remonter dans l'arborescence jusqu'au module racine
+        while (current != null && !current.equals(moduleRoot)) {
+            // Si on trouve un pom.xml dans un répertoire intermédiaire,
+            // c'est que le fichier appartient à un sous-module
+            if (Files.exists(current.resolve("pom.xml"))) {
+                return true;
+            }
+            current = current.getParent();
+        }
+        
+        return false;
     }
     
     private String computeFileHash(String filePath) {
