@@ -1,0 +1,16 @@
+{
+  "name": "ollama",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node --experimental-modules ollama.js"
+  },
+  "dependencies": {
+    "ollama": "^0.5.12"
+  },
+  "main": "ollama.js",
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": ""
+}
